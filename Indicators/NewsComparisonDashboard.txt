@@ -1,0 +1,799 @@
+//+------------------------------------------------------------------+
+//| NewsComparisonDashboard.mq5                                      |
+//| Vergelijkt economische kalender van 3 bronnen in MT5 panel       |
+//| Multi-currency: USD, EUR, GBP, JPY, CAD                         |
+//| v4.00 — popup form met toggle-knop op de chart                   |
+//+------------------------------------------------------------------+
+#property copyright "NewsComparisonDashboard"
+#property version   "4.00"
+#property indicator_chart_window
+
+//+------------------------------------------------------------------+
+// Input parameters
+//+------------------------------------------------------------------+
+input string   JBLANKED_API_KEY  = "jouw_jblanked_key";
+input string   FINNHUB_API_KEY   = "jouw_finnhub_key";
+input bool     SHOW_USD          = true;
+input bool     SHOW_EUR          = true;
+input bool     SHOW_GBP          = true;
+input bool     SHOW_JPY          = true;
+input bool     SHOW_CAD          = true;
+input int      REFRESH_SECONDS   = 300;
+input int      FONT_SIZE         = 9;
+input int      CHAR_WIDTH        = 7;
+input int      COL_PADDING       = 14;
+input int      ROW_HEIGHT        = 20;
+
+//+------------------------------------------------------------------+
+// Layout constanten
+//+------------------------------------------------------------------+
+#define NUM_COLS            8
+#define MAX_CAL_ROWS        30
+#define MAX_FINNHUB_ROWS    10
+#define MAX_EVENT_NAME_LEN  32
+#define MAX_HEADLINE_LEN    60
+#define MIN_MATCH_KEY_LEN   5
+#define MATCH_KEY_LEN       12
+
+// Toggle-knop (altijd zichtbaar, rechtsonder)
+#define BTN_W               130
+#define BTN_H               28
+#define BTN_MARGIN          10
+
+// Popup form
+#define FORM_PADDING        12
+#define TAB_H               26
+#define TAB_MIN_W           48
+#define TITLE_H             36
+#define CLOSE_BTN_W         28
+#define SECTION_H           22
+#define HDR_H               20
+#define SHADOW_OFFSET       4
+
+//+------------------------------------------------------------------+
+// Structuur voor één nieuwsevent
+//+------------------------------------------------------------------+
+struct NewsEvent
+{
+   string   source;
+   string   time_str;
+   string   currency;
+   string   event_name;
+   string   impact;
+   string   actual;
+   string   forecast;
+   string   previous;
+   datetime sort_time;
+};
+
+//+------------------------------------------------------------------+
+// Globale staat
+//+------------------------------------------------------------------+
+NewsEvent mql5_events[];
+NewsEvent jblanked_ff_events[];
+NewsEvent jblanked_fxs_events[];
+NewsEvent finnhub_events[];
+datetime  last_refresh  = 0;
+string    active_currencies[];
+string    active_tab    = "ALL";
+bool      form_visible  = false;   // popup aan/uit
+
+string col_headers[NUM_COLS] = {"Valuta","Event","Tijd","MQL5 Fore.","FF Fore.","FXS Fore.","Actual","Impact"};
+
+//+------------------------------------------------------------------+
+// Kleuren
+//+------------------------------------------------------------------+
+color CurrencyColor(string cur)
+{
+   if(cur == "USD") return C'110,190,255';
+   if(cur == "EUR") return C'90,220,140';
+   if(cur == "GBP") return C'235,100,100';
+   if(cur == "JPY") return C'245,210,70';
+   if(cur == "CAD") return C'200,145,255';
+   return clrSilver;
+}
+color TabActiveBg(string cur)
+{
+   if(cur == "USD") return C'18,55,100';
+   if(cur == "EUR") return C'14,70,38';
+   if(cur == "GBP") return C'75,18,18';
+   if(cur == "JPY") return C'80,65,8';
+   if(cur == "CAD") return C'58,20,85';
+   return C'30,35,85';   // ALL
+}
+
+//+------------------------------------------------------------------+
+// OnInit / OnTimer / OnDeinit
+//+------------------------------------------------------------------+
+int OnInit()
+{
+   BuildActiveCurrencies();
+   active_tab   = "ALL";
+   form_visible = false;
+   EventSetTimer(REFRESH_SECONDS);
+   FetchAllSources();
+   DrawToggleButton();
+   // Form start verborgen — alleen knop zichtbaar
+   return INIT_SUCCEEDED;
+}
+
+void OnTimer()
+{
+   FetchAllSources();
+   if(form_visible) RedrawForm();
+}
+
+void OnDeinit(const int reason)
+{
+   ObjectsDeleteAll(0, "NCD_");
+   EventKillTimer();
+}
+
+int OnCalculate(const int r, const int p, const datetime &t[],
+                const double &o[], const double &h[],
+                const double &l[], const double &c[],
+                const long &tv[], const long &ov[], const int &s[])
+{ return r; }
+
+//+------------------------------------------------------------------+
+// CHART EVENTS
+//+------------------------------------------------------------------+
+void OnChartEvent(const int id, const long &lparam, const double &dparam, const string &sparam)
+{
+   if(id != CHARTEVENT_OBJECT_CLICK) return;
+
+   // Toggle-knop
+   if(sparam == "NCD_TOGGLE_BTN" || sparam == "NCD_TOGGLE_LBL")
+   {
+      form_visible = !form_visible;
+      if(form_visible)
+         RedrawForm();
+      else
+         CloseForm();
+      DrawToggleButton();
+      return;
+   }
+
+   // Sluit-kruisje in form
+   if(sparam == "NCD_CLOSE_BTN" || sparam == "NCD_CLOSE_LBL")
+   {
+      form_visible = false;
+      CloseForm();
+      DrawToggleButton();
+      return;
+   }
+
+   // Tabblad klik
+   string tab_prefix = "NCD_TAB_BTN_";
+   if(StringFind(sparam, tab_prefix) == 0)
+   {
+      string clicked = StringSubstr(sparam, StringLen(tab_prefix));
+      if(clicked != active_tab)
+      {
+         active_tab = clicked;
+         if(form_visible) RedrawForm();
+      }
+      return;
+   }
+}
+
+//+------------------------------------------------------------------+
+// TOGGLE KNOP  (altijd zichtbaar, rechtsonder in het chart)
+//+------------------------------------------------------------------+
+void DrawToggleButton()
+{
+   int chart_w = (int)ChartGetInteger(0, CHART_WIDTH_IN_PIXELS);
+   int chart_h = (int)ChartGetInteger(0, CHART_HEIGHT_IN_PIXELS);
+   int bx = chart_w - BTN_W - BTN_MARGIN;
+   int by = chart_h - BTN_H - BTN_MARGIN;
+
+   color bg  = form_visible ? C'20,80,160'  : C'15,15,40';
+   color bdr = form_visible ? C'80,160,255' : C'60,60,120';
+   color fg  = form_visible ? clrWhite      : C'180,180,220';
+   string lbl = form_visible ? "📰 Sluit Nieuws" : "📰 Open Nieuws";
+
+   // Schaduw
+   DrawClickRect("NCD_TOGGLE_SHADOW", bx + 3, by + 3, BTN_W, BTN_H, C'5,5,15', false);
+   // Knop achtergrond
+   DrawClickRect("NCD_TOGGLE_BTN", bx, by, BTN_W, BTN_H, bg, true);
+   // Rand (dunne overlay)
+   DrawClickRect("NCD_TOGGLE_BDR", bx, by, BTN_W, 2, bdr, false);
+   // Label
+   DrawClickLabel("NCD_TOGGLE_LBL", lbl, bx + 10, by + 7, FONT_SIZE, fg, true);
+}
+
+//+------------------------------------------------------------------+
+// POPUP FORM TEKENEN
+//+------------------------------------------------------------------+
+void CloseForm()
+{
+   // Verwijder alles behalve de toggle-knop objecten
+   int total = ObjectsTotal(0);
+   for(int i = total - 1; i >= 0; i--)
+   {
+      string name = ObjectName(0, i);
+      if(StringFind(name, "NCD_") == 0 && StringFind(name, "NCD_TOGGLE") < 0)
+         ObjectDelete(0, name);
+   }
+   ChartRedraw();
+}
+
+void RedrawForm()
+{
+   CloseForm();
+
+   int col_w[], col_off[], total_w;
+   CalcColumnWidths(col_w, total_w, active_tab);
+   BuildColOffsets(col_w, col_off);
+
+   // Tel gefilterde kalenderrijen
+   int n_cal = 0;
+   for(int i = 0; i < MathMin(ArraySize(mql5_events), MAX_CAL_ROWS); i++)
+      if(active_tab == "ALL" || mql5_events[i].currency == active_tab) n_cal++;
+   int n_fh = ArraySize(finnhub_events);
+
+   // Form hoogte berekenen
+   int content_h = TITLE_H + TAB_H + 6
+                 + SECTION_H + HDR_H
+                 + n_cal * ROW_HEIGHT + (n_cal == 0 ? ROW_HEIGHT : 0) + 8
+                 + SECTION_H + HDR_H
+                 + n_fh  * ROW_HEIGHT + (n_fh  == 0 ? ROW_HEIGHT : 0) + 8
+                 + FORM_PADDING;
+
+   int form_w = total_w + FORM_PADDING * 2;
+   int form_h = content_h;
+
+   // Centreer popup in chart
+   int chart_w = (int)ChartGetInteger(0, CHART_WIDTH_IN_PIXELS);
+   int chart_h = (int)ChartGetInteger(0, CHART_HEIGHT_IN_PIXELS);
+   int fx = MathMax(10, (chart_w - form_w) / 2);
+   int fy = MathMax(10, (chart_h - form_h) / 2);
+
+   DrawFormBackground(fx, fy, form_w, form_h);
+   DrawFormTitle(fx, fy, form_w);
+   int cy = fy + TITLE_H;
+   DrawTabs(fx + FORM_PADDING, cy, total_w);
+   cy += TAB_H + 6;
+   DrawCalendarSection(fx + FORM_PADDING, cy, col_w, col_off, total_w, active_tab);
+   DrawFinnhubSection (fx + FORM_PADDING, cy, col_w, total_w, n_fh);
+
+   ChartRedraw();
+}
+
+//+------------------------------------------------------------------+
+// Form achtergrond + slagschaduw
+//+------------------------------------------------------------------+
+void DrawFormBackground(int fx, int fy, int fw, int fh)
+{
+   // Slagschaduw
+   DrawRect("NCD_FORM_SHADOW", fx + SHADOW_OFFSET, fy + SHADOW_OFFSET, fw, fh, C'5,5,10');
+   // Hoofdachtergrond
+   DrawRect("NCD_FORM_BG",     fx, fy, fw, fh, C'18,18,28');
+   // Subtiele rand
+   DrawRect("NCD_FORM_BDR_T",  fx, fy,      fw, 1,  C'60,60,100');
+   DrawRect("NCD_FORM_BDR_B",  fx, fy+fh-1, fw, 1,  C'40,40,70');
+   DrawRect("NCD_FORM_BDR_L",  fx, fy,      1,  fh, C'60,60,100');
+   DrawRect("NCD_FORM_BDR_R",  fx+fw-1, fy, 1,  fh, C'40,40,70');
+}
+
+//+------------------------------------------------------------------+
+// Titelregel met sluit-knop
+//+------------------------------------------------------------------+
+void DrawFormTitle(int fx, int fy, int fw)
+{
+   // Titelregel achtergrond met gradient-simulatie (2 lagen)
+   DrawRect("NCD_TITLE_BG1", fx,     fy,    fw,         TITLE_H,     C'12,18,50');
+   DrawRect("NCD_TITLE_BG2", fx,     fy,    fw,         TITLE_H / 2, C'18,28,70');
+   // Accentlijn onderaan titel
+   DrawRect("NCD_TITLE_LINE", fx,    fy + TITLE_H - 2, fw, 2,        C'40,80,200');
+
+   // Titel tekst
+   string title = "📰  NEWS COMPARISON  |  " + ActiveCurrenciesLabel()
+                + "  |  🔴 High  🟡 Medium  🟢 Low";
+   DrawLabel("NCD_TITLE_TXT", title, fx + FORM_PADDING, fy + 10, FONT_SIZE + 1, clrGold);
+
+   // Vernieuwingstijd
+   DrawLabel("NCD_TITLE_REF",
+             "Vernieuwd: " + TimeToString(last_refresh, TIME_DATE|TIME_MINUTES),
+             fx + FORM_PADDING, fy + TITLE_H - 14, FONT_SIZE - 1, C'120,120,160');
+
+   // Sluit-knop  [ ✕ ]
+   int cx = fx + fw - CLOSE_BTN_W - 6;
+   int cy = fy + (TITLE_H - CLOSE_BTN_W) / 2;
+   DrawClickRect("NCD_CLOSE_BTN", cx, cy, CLOSE_BTN_W, CLOSE_BTN_W, C'100,30,30', true);
+   DrawClickLabel("NCD_CLOSE_LBL", "✕", cx + 7, cy + 5, FONT_SIZE, clrWhite, true);
+}
+
+//+------------------------------------------------------------------+
+// TABBLADEN
+//+------------------------------------------------------------------+
+void DrawTabs(int x, int y, int total_w)
+{
+   // Tabbladbalk
+   DrawRect("NCD_TABBAR", x - 4, y, total_w + 8, TAB_H, C'10,10,20');
+
+   DrawOneTab("ALL", x, y, TAB_MIN_W);
+   int tx = x + TAB_MIN_W + 4;
+   for(int i = 0; i < ArraySize(active_currencies); i++)
+   {
+      DrawOneTab(active_currencies[i], tx, y, TAB_MIN_W + 6);
+      tx += TAB_MIN_W + 10;
+   }
+}
+
+void DrawOneTab(string cur, int x, int y, int w)
+{
+   bool  is_act = (active_tab == cur);
+   color bg     = is_act ? TabActiveBg(cur) : C'16,16,30';
+   color fg     = is_act ? (cur == "ALL" ? clrWhite : CurrencyColor(cur)) : C'80,80,110';
+   color accent = is_act ? (cur == "ALL" ? C'80,120,255' : CurrencyColor(cur)) : C'35,35,55';
+
+   // Tab achtergrond (klikbaar)
+   string btn = "NCD_TAB_BTN_" + cur;
+   if(ObjectFind(0, btn) < 0) ObjectCreate(0, btn, OBJ_RECTANGLE_LABEL, 0, 0, 0);
+   ObjectSetInteger(0, btn, OBJPROP_XDISTANCE,   x);
+   ObjectSetInteger(0, btn, OBJPROP_YDISTANCE,   y);
+   ObjectSetInteger(0, btn, OBJPROP_XSIZE,        w);
+   ObjectSetInteger(0, btn, OBJPROP_YSIZE,        TAB_H);
+   ObjectSetInteger(0, btn, OBJPROP_BGCOLOR,      bg);
+   ObjectSetInteger(0, btn, OBJPROP_BORDER_TYPE,  BORDER_FLAT);
+   ObjectSetInteger(0, btn, OBJPROP_CORNER,       CORNER_LEFT_UPPER);
+   ObjectSetInteger(0, btn, OBJPROP_SELECTABLE,   true);
+   ObjectSetInteger(0, btn, OBJPROP_HIDDEN,       false);
+   ObjectSetInteger(0, btn, OBJPROP_BACK,         true);
+
+   // Bovenrand accent
+   DrawRect("NCD_TAB_TOP_" + cur, x, y, w, 3, accent);
+
+   // Label
+   int lx = x + (w - StringLen(cur) * (FONT_SIZE)) / 2;
+   DrawLabel("NCD_TAB_LBL_" + cur, cur, lx, y + 6, FONT_SIZE, fg);
+}
+
+//+------------------------------------------------------------------+
+// KALENDER SECTIE
+//+------------------------------------------------------------------+
+void DrawCalendarSection(int x, int &y, int &col_w[], int &col_off[], int total_w, string filter)
+{
+   string title = (filter == "ALL")
+      ? "  ECONOMISCHE KALENDER  (" + ActiveCurrenciesLabel() + ")"
+      : "  ECONOMISCHE KALENDER  —  " + filter;
+   DrawSectionHeader("NCD_SEC1", title, x, y, total_w);
+   y += SECTION_H + 2;
+
+   DrawHeaderRow(col_headers, col_w, col_off, x, y, total_w);
+   y += HDR_H + 2;
+
+   int drawn = 0;
+   for(int i = 0; i < MathMin(ArraySize(mql5_events), MAX_CAL_ROWS); i++)
+   {
+      if(filter != "ALL" && mql5_events[i].currency != filter) continue;
+      DrawCalendarRow(i, drawn, x, y, col_off, total_w);
+      y += ROW_HEIGHT;
+      drawn++;
+   }
+   if(drawn == 0)
+   {
+      DrawLabel("NCD_EMPTY_CAL",
+         filter == "ALL" ? "Geen events gevonden" : "Geen events voor " + filter,
+         x + 4, y + 2, FONT_SIZE, C'100,100,130');
+      y += ROW_HEIGHT;
+   }
+   y += 8;
+}
+
+void DrawCalendarRow(int si, int ri, int x, int y, int &co[], int total_w)
+{
+   string cur      = mql5_events[si].currency;
+   string ff_fore  = FindForecast(mql5_events[si].event_name, cur, jblanked_ff_events);
+   string fxs_fore = FindForecast(mql5_events[si].event_name, cur, jblanked_fxs_events);
+   string sname    = TruncateStr(mql5_events[si].event_name, MAX_EVENT_NAME_LEN);
+
+   // Rijkleur op basis van impact + afwisseling
+   color row_bg;
+   if(StringFind(mql5_events[si].impact, "High")   >= 0) row_bg = (ri%2==0)?C'55,18,18':C'45,12,12';
+   else if(StringFind(mql5_events[si].impact,"Medium")>=0) row_bg = (ri%2==0)?C'55,40,12':C'44,32,10';
+   else                                                    row_bg = (ri%2==0)?C'22,32,22':C'17,26,17';
+
+   string rid = "r" + IntegerToString(si);
+   DrawRect("NCD_ROW_" + rid, x - 4, y - 1, total_w + 8, ROW_HEIGHT - 1, row_bg);
+
+   // Valuta-kleurstrook links
+   DrawRect("NCD_ROWBAR_" + rid, x - 4, y - 1, 3, ROW_HEIGHT - 1, CurrencyColor(cur));
+
+   DrawCell("NCD_E_"+rid+"_0", cur,                           x+co[0], y+2, CurrencyColor(cur));
+   DrawCell("NCD_E_"+rid+"_1", sname,                         x+co[1], y+2, clrWhite);
+   DrawCell("NCD_E_"+rid+"_2", mql5_events[si].time_str,      x+co[2], y+2, C'130,185,255');
+   DrawCell("NCD_E_"+rid+"_3", mql5_events[si].forecast,      x+co[3], y+2, C'255,220,80');
+   DrawCell("NCD_E_"+rid+"_4", ff_fore,                       x+co[4], y+2, ForecastColor(ff_fore,  mql5_events[si].forecast));
+   DrawCell("NCD_E_"+rid+"_5", fxs_fore,                      x+co[5], y+2, ForecastColor(fxs_fore, mql5_events[si].forecast));
+   DrawCell("NCD_E_"+rid+"_6", mql5_events[si].actual,        x+co[6], y+2, C'80,230,80');
+   DrawCell("NCD_E_"+rid+"_7", mql5_events[si].impact,        x+co[7], y+2, ImpactColor(mql5_events[si].impact));
+}
+
+//+------------------------------------------------------------------+
+// FINNHUB SECTIE
+//+------------------------------------------------------------------+
+void DrawFinnhubSection(int x, int &y, int &col_w[], int total_w, int n_fh)
+{
+   DrawSectionHeader("NCD_SEC2", "  FOREX HEADLINES  (Finnhub)", x, y, total_w);
+   y += SECTION_H + 2;
+
+   DrawRect("NCD_NHDR_BG", x - 4, y - 1, total_w + 8, HDR_H + 1, C'12,35,55');
+   DrawCell("NCD_NHDR_SRC",  "Bron",     x,            y, C'160,160,200');
+   DrawCell("NCD_NHDR_HEAD", "Headline", x + col_w[0], y, C'160,160,200');
+   y += HDR_H + 2;
+
+   for(int j = 0; j < n_fh; j++)
+   {
+      string hl    = TruncateStr(finnhub_events[j].event_name, MAX_HEADLINE_LEN);
+      color row_bg = (j%2==0) ? C'24,24,40' : C'20,20,34';
+      DrawRect("NCD_NR_"  + j, x - 4, y - 1, total_w + 8, ROW_HEIGHT - 1, row_bg);
+      DrawCell("NCD_NS_"  + j, finnhub_events[j].source, x,            y+2, C'110,110,150');
+      DrawCell("NCD_NH_"  + j, hl,                        x + col_w[0], y+2, C'210,210,230');
+      y += ROW_HEIGHT;
+   }
+   if(n_fh == 0)
+   {
+      DrawLabel("NCD_EMPTY_FH", "Geen headlines ontvangen", x + 4, y + 2, FONT_SIZE, C'100,100,130');
+      y += ROW_HEIGHT;
+   }
+}
+
+//+------------------------------------------------------------------+
+// Teken helpers
+//+------------------------------------------------------------------+
+void DrawSectionHeader(string name, string text, int x, int y, int w)
+{
+   DrawRect(name+"_BG1", x-4, y,   w+8, SECTION_H,   C'10,25,55');
+   DrawRect(name+"_BG2", x-4, y,   w+8, SECTION_H/2, C'15,35,70');
+   DrawRect(name+"_ACC", x-4, y,   3,   SECTION_H,   C'40,80,200');
+   DrawLabel(name,  text, x+4, y+4, FONT_SIZE, C'120,175,255');
+}
+
+void DrawHeaderRow(string &headers[], const int &cw[], const int &co[], int x, int y, int w)
+{
+   DrawRect("NCD_HROW_BG", x-4, y-1, w+8, HDR_H+1, C'14,14,36');
+   for(int c = 0; c < NUM_COLS; c++)
+      DrawCell("NCD_HDR_"+c, headers[c], x+co[c], y, C'160,160,200');
+}
+
+void DrawCell(string name, string text, int x, int y, color clr)
+{ DrawLabel(name, text, x, y, FONT_SIZE, clr); }
+
+void DrawLabel(string name, string text, int x, int y, int sz, color clr)
+{
+   if(ObjectFind(0, name) < 0) ObjectCreate(0, name, OBJ_LABEL, 0, 0, 0);
+   ObjectSetInteger(0, name, OBJPROP_XDISTANCE, x);
+   ObjectSetInteger(0, name, OBJPROP_YDISTANCE, y);
+   ObjectSetInteger(0, name, OBJPROP_CORNER,    CORNER_LEFT_UPPER);
+   ObjectSetString (0, name, OBJPROP_TEXT,       text);
+   ObjectSetInteger(0, name, OBJPROP_FONTSIZE,   sz);
+   ObjectSetInteger(0, name, OBJPROP_COLOR,      clr);
+   ObjectSetString (0, name, OBJPROP_FONT,       "Consolas");
+   ObjectSetInteger(0, name, OBJPROP_SELECTABLE, false);
+}
+
+// Klikbare label (voor sluit-knop en toggle)
+void DrawClickLabel(string name, string text, int x, int y, int sz, color clr, bool selectable)
+{
+   DrawLabel(name, text, x, y, sz, clr);
+   ObjectSetInteger(0, name, OBJPROP_SELECTABLE, selectable);
+   ObjectSetInteger(0, name, OBJPROP_HIDDEN, false);
+}
+
+void DrawRect(string name, int x, int y, int w, int h, color clr)
+{
+   if(ObjectFind(0, name) < 0) ObjectCreate(0, name, OBJ_RECTANGLE_LABEL, 0, 0, 0);
+   ObjectSetInteger(0, name, OBJPROP_XDISTANCE,  x);
+   ObjectSetInteger(0, name, OBJPROP_YDISTANCE,  y);
+   ObjectSetInteger(0, name, OBJPROP_XSIZE,       w);
+   ObjectSetInteger(0, name, OBJPROP_YSIZE,       h);
+   ObjectSetInteger(0, name, OBJPROP_BGCOLOR,     clr);
+   ObjectSetInteger(0, name, OBJPROP_BORDER_TYPE, BORDER_FLAT);
+   ObjectSetInteger(0, name, OBJPROP_CORNER,      CORNER_LEFT_UPPER);
+   ObjectSetInteger(0, name, OBJPROP_SELECTABLE,  false);
+   ObjectSetInteger(0, name, OBJPROP_BACK,        true);
+}
+
+// Klikbare rechthoek (voor toggle-knop en tabs)
+void DrawClickRect(string name, int x, int y, int w, int h, color clr, bool selectable)
+{
+   DrawRect(name, x, y, w, h, clr);
+   ObjectSetInteger(0, name, OBJPROP_SELECTABLE, selectable);
+   ObjectSetInteger(0, name, OBJPROP_HIDDEN,     false);
+}
+
+//+------------------------------------------------------------------+
+// Kolombreedte berekening
+//+------------------------------------------------------------------+
+void CalcColumnWidths(int &col_w[], int &total_w, string filter)
+{
+   ArrayResize(col_w, NUM_COLS);
+   for(int c = 0; c < NUM_COLS; c++)
+      col_w[c] = StringLen(col_headers[c]);
+
+   int n = MathMin(ArraySize(mql5_events), MAX_CAL_ROWS);
+   for(int i = 0; i < n; i++)
+   {
+      if(filter != "ALL" && mql5_events[i].currency != filter) continue;
+      string ff  = FindForecast(mql5_events[i].event_name, mql5_events[i].currency, jblanked_ff_events);
+      string fxs = FindForecast(mql5_events[i].event_name, mql5_events[i].currency, jblanked_fxs_events);
+      string sn  = TruncateStr(mql5_events[i].event_name, MAX_EVENT_NAME_LEN);
+      col_w[0] = MathMax(col_w[0], StringLen(mql5_events[i].currency));
+      col_w[1] = MathMax(col_w[1], StringLen(sn));
+      col_w[2] = MathMax(col_w[2], StringLen(mql5_events[i].time_str));
+      col_w[3] = MathMax(col_w[3], StringLen(mql5_events[i].forecast));
+      col_w[4] = MathMax(col_w[4], StringLen(ff));
+      col_w[5] = MathMax(col_w[5], StringLen(fxs));
+      col_w[6] = MathMax(col_w[6], StringLen(mql5_events[i].actual));
+      col_w[7] = MathMax(col_w[7], StringLen(mql5_events[i].impact));
+   }
+   for(int j = 0; j < ArraySize(finnhub_events); j++)
+   {
+      col_w[0] = MathMax(col_w[0], StringLen(finnhub_events[j].source));
+      col_w[1] = MathMax(col_w[1], StringLen(TruncateStr(finnhub_events[j].event_name, MAX_HEADLINE_LEN)));
+   }
+   total_w = 0;
+   for(int c = 0; c < NUM_COLS; c++)
+   {
+      col_w[c] = col_w[c] * CHAR_WIDTH + COL_PADDING;
+      total_w += col_w[c];
+   }
+   total_w += 8;
+}
+
+void BuildColOffsets(const int &cw[], int &off[])
+{
+   ArrayResize(off, NUM_COLS);
+   off[0] = 0;
+   for(int c = 1; c < NUM_COLS; c++) off[c] = off[c-1] + cw[c-1];
+}
+
+//+------------------------------------------------------------------+
+// Data ophalen
+//+------------------------------------------------------------------+
+void BuildActiveCurrencies()
+{
+   bool   flags[5] = {SHOW_USD, SHOW_EUR, SHOW_GBP, SHOW_JPY, SHOW_CAD};
+   string names[5] = {"USD","EUR","GBP","JPY","CAD"};
+   ArrayResize(active_currencies, 0);
+   for(int i = 0; i < 5; i++)
+      if(flags[i])
+      {
+         int n = ArraySize(active_currencies);
+         ArrayResize(active_currencies, n+1);
+         active_currencies[n] = names[i];
+      }
+}
+
+bool IsCurrencyActive(string cur)
+{
+   for(int i = 0; i < ArraySize(active_currencies); i++)
+      if(active_currencies[i] == cur) return true;
+   return false;
+}
+
+string ActiveCurrenciesLabel()
+{
+   string out = "";
+   for(int i = 0; i < ArraySize(active_currencies); i++)
+   {
+      if(i > 0) out += "  ";
+      out += active_currencies[i];
+   }
+   return out;
+}
+
+void SortEventsByTime(NewsEvent &arr[])
+{
+   int n = ArraySize(arr);
+   for(int a = 0; a < n-1; a++)
+      for(int b = 0; b < n-a-1; b++)
+         if(arr[b].sort_time > arr[b+1].sort_time)
+         {
+            NewsEvent tmp = arr[b]; arr[b] = arr[b+1]; arr[b+1] = tmp;
+         }
+}
+
+void FetchMQL5Calendar()
+{
+   ArrayResize(mql5_events, 0);
+   MqlCalendarValue values[];
+   datetime from = TimeCurrent(), to = from + 86400;
+   if(!CalendarValueHistory(values, from, to))
+   { Print("MQL5Cal fout: ", GetLastError()); return; }
+
+   for(int i = 0; i < ArraySize(values); i++)
+   {
+      MqlCalendarEvent   ei; MqlCalendarCountry ci;
+      if(!CalendarEventById(values[i].event_id, ei))       continue;
+      if(!CalendarCountryById(ei.country_id, ci))          continue;
+      if(!IsCurrencyActive(ci.currency))                   continue;
+      int idx = ArraySize(mql5_events);
+      ArrayResize(mql5_events, idx+1);
+      mql5_events[idx].source     = "MQL5";
+      mql5_events[idx].sort_time  = values[i].time;
+      mql5_events[idx].time_str   = TimeToString(values[i].time, TIME_DATE|TIME_MINUTES);
+      mql5_events[idx].currency   = ci.currency;
+      mql5_events[idx].event_name = ei.name;
+      mql5_events[idx].impact     = ImportanceToStr(ei.importance);
+      mql5_events[idx].actual     = FormatCalValue(values[i].actual_value,   ei.digits);
+      mql5_events[idx].forecast   = FormatCalValue(values[i].forecast_value, ei.digits);
+      mql5_events[idx].previous   = FormatCalValue(values[i].prev_value,     ei.digits);
+   }
+   SortEventsByTime(mql5_events);
+}
+
+string FormatCalValue(long raw, int digits)
+{
+   if(raw == LONG_MIN) return "—";
+   return DoubleToString((double)raw / MathPow(10, digits), digits);
+}
+
+string ImportanceToStr(ENUM_CALENDAR_EVENT_IMPORTANCE imp)
+{
+   switch(imp)
+   {
+      case CALENDAR_IMPORTANCE_HIGH:     return "High";
+      case CALENDAR_IMPORTANCE_MODERATE: return "Medium";
+      case CALENDAR_IMPORTANCE_LOW:      return "Low";
+      default:                           return "—";
+   }
+}
+
+void FetchJblankedCalendar(string source_type, NewsEvent &result[])
+{
+   ArrayResize(result, 0);
+   string src_tag = (source_type == "forex-factory") ? "FF" : "FXS";
+   for(int ci = 0; ci < ArraySize(active_currencies); ci++)
+   {
+      string cur = active_currencies[ci];
+      string url = "https://www.jblanked.com/news/api/" + source_type + "/calendar/week/?currency=" + cur;
+      string headers = "Authorization: Api-Key " + JBLANKED_API_KEY + "\r\n";
+      char post[], body[]; string resp_headers;
+      int res = WebRequest("GET", url, headers, 5000, post, body, resp_headers);
+      if(res != 200) { Print("jblanked (", source_type, "/", cur, ") HTTP ", res); continue; }
+      ParseJblankedJSON(CharArrayToString(body), src_tag, cur, result);
+   }
+}
+
+void ParseJblankedJSON(string json, string src, string fallback, NewsEvent &result[])
+{
+   int pos = 0;
+   while(true)
+   {
+      int s = StringFind(json, "{", pos); if(s < 0) break;
+      int e = FindMatchingBrace(json, s); if(e < 0) break;
+      string obj = StringSubstr(json, s, e-s+1);
+      string name = ExtractJSONValue(obj, "name");
+      string cur  = ExtractJSONValue(obj, "currency");
+      if(cur == "") cur = fallback;
+      if(name != "")
+      {
+         int idx = ArraySize(result); ArrayResize(result, idx+1);
+         result[idx].source     = src;
+         result[idx].time_str   = ExtractJSONValue(obj, "date");
+         result[idx].currency   = cur;
+         result[idx].event_name = name;
+         result[idx].impact     = ExtractJSONValue(obj, "impact");
+         result[idx].actual     = NullCoalesce(ExtractJSONValue(obj, "actual"));
+         result[idx].forecast   = NullCoalesce(ExtractJSONValue(obj, "forecast"));
+         result[idx].previous   = NullCoalesce(ExtractJSONValue(obj, "previous"));
+         result[idx].sort_time  = 0;
+      }
+      pos = e+1;
+   }
+}
+
+void FetchFinnhubNews()
+{
+   ArrayResize(finnhub_events, 0);
+   string url = "https://finnhub.io/api/v1/news?category=forex&token=" + FINNHUB_API_KEY;
+   char post[], body[]; string resp_headers;
+   int res = WebRequest("GET", url, "", 5000, post, body, resp_headers);
+   if(res != 200) { Print("Finnhub fout: HTTP ", res); return; }
+
+   string json = CharArrayToString(body);
+   int pos = 0, count = 0;
+   while(count < MAX_FINNHUB_ROWS)
+   {
+      int s = StringFind(json, "{", pos); if(s < 0) break;
+      int e = FindMatchingBrace(json, s); if(e < 0) break;
+      string obj      = StringSubstr(json, s, e-s+1);
+      string headline = ExtractJSONValue(obj, "headline");
+      string src      = ExtractJSONValue(obj, "source");
+      if(headline != "")
+      {
+         int idx = ArraySize(finnhub_events); ArrayResize(finnhub_events, idx+1);
+         finnhub_events[idx].source     = src;
+         finnhub_events[idx].event_name = headline;
+         finnhub_events[idx].time_str   = ExtractJSONValue(obj, "datetime");
+         finnhub_events[idx].currency   = "FX";
+         finnhub_events[idx].impact     = "News";
+         finnhub_events[idx].sort_time  = 0;
+         count++;
+      }
+      pos = e+1;
+   }
+}
+
+void FetchAllSources()
+{
+   BuildActiveCurrencies();
+   Print("NewsComparison: ophalen voor ", ActiveCurrenciesLabel(), "...");
+   FetchMQL5Calendar();
+   FetchJblankedCalendar("forex-factory", jblanked_ff_events);
+   FetchJblankedCalendar("fxstreet",      jblanked_fxs_events);
+   FetchFinnhubNews();
+   last_refresh = TimeCurrent();
+   Print("MQL5=",ArraySize(mql5_events)," FF=",ArraySize(jblanked_ff_events),
+         " FXS=",ArraySize(jblanked_fxs_events)," FH=",ArraySize(finnhub_events));
+}
+
+//+------------------------------------------------------------------+
+// Data helpers
+//+------------------------------------------------------------------+
+string FindForecast(string name, string currency, NewsEvent &arr[])
+{
+   string nl = name; StringToLower(nl);
+   int kl  = MathMax(MIN_MATCH_KEY_LEN, MathMin(MATCH_KEY_LEN, StringLen(nl)));
+   string key = StringSubstr(nl, 0, kl);
+   for(int i = 0; i < ArraySize(arr); i++)
+   {
+      if(arr[i].currency != currency) continue;
+      string n = arr[i].event_name; StringToLower(n);
+      if(StringFind(n, key) >= 0) return arr[i].forecast == "" ? "—" : arr[i].forecast;
+   }
+   return "N/A";
+}
+
+string ExtractJSONValue(string json, string key)
+{
+   string search = "\"" + key + "\":\"";
+   int start = StringFind(json, search);
+   if(start < 0)
+   {
+      search = "\"" + key + "\":"; start = StringFind(json, search);
+      if(start < 0) return "";
+      start += StringLen(search);
+      int e1 = StringFind(json, ",", start), e2 = StringFind(json, "}", start);
+      int end = (e1 < 0 || (e2 >= 0 && e2 < e1)) ? e2 : e1;
+      return end < 0 ? "" : StringSubstr(json, start, end-start);
+   }
+   start += StringLen(search);
+   int end = StringFind(json, "\"", start);
+   return end < 0 ? "" : StringSubstr(json, start, end-start);
+}
+
+int FindMatchingBrace(string json, int op)
+{
+   int depth = 0;
+   for(int i = op; i < StringLen(json); i++)
+   {
+      ushort c = StringGetCharacter(json, i);
+      if(c == '{') depth++;
+      else if(c == '}') { depth--; if(depth == 0) return i; }
+   }
+   return -1;
+}
+
+color ForecastColor(string fore, string mql5_fore)
+{
+   if(fore == "N/A") return C'90,90,110';
+   return (fore == mql5_fore) ? C'255,220,80' : C'255,90,60';
+}
+
+color ImpactColor(string impact)
+{
+   if(StringFind(impact,"High")   >= 0) return C'255,70,70';
+   if(StringFind(impact,"Medium") >= 0) return C'255,165,0';
+   return C'80,220,80';
+}
+
+string TruncateStr(string s, int ml)
+{
+   return StringLen(s) > ml ? StringSubstr(s, 0, ml) + "." : s;
+}
+
+string NullCoalesce(string v) { return v == "" ? "—" : v; }
