@@ -213,6 +213,10 @@ public:
    //--- Full redraw (implements pure virtual from CGUIBase)
    virtual void   Redraw()
      {
+      // Always clear all objects first so drag/resize doesn't leave ghosts
+      DeleteAll();
+      if(m_tabBar != NULL) m_tabBar.DeleteAll();
+
       if(m_minimized)
         {
          DrawTitleBar();

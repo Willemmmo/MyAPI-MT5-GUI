@@ -30,7 +30,7 @@ int OnInit()
       "Tab 6","Tab 7","Tab 8","Tab 9","Tab 10"
    );
 
-   gui.SetSymbol(_Symbol, PeriodToString(Period()));
+   gui.SetSymbol(_Symbol, EnumToString((ENUM_TIMEFRAMES)Period()));
    gui.Show();
    gui.Redraw();
    return INIT_SUCCEEDED;
