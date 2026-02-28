@@ -1,0 +1,23 @@
+# Compiled MQL5 binaries
+*.ex5
+*.ex4
+
+# MetaTrader logs
+*.log
+*.journal
+
+# MetaTrader cache
+*.dat
+*.hst
+*.fxt
+
+# MetaEditor backups
+*.bak
+
+# Windows
+Thumbs.db
+Desktop.ini
+$RECYCLE.BIN/
+
+# Tester results
+tester/
